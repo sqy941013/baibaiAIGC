@@ -16,11 +16,13 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from aigc_round_service import (
+    INLINE_BOLD_TOLERANCE,
     RoundPausedError,
     RoundStoppedError,
     build_progress_path,
     build_stop_request_path,
     detect_disallowed_answer_style_pattern,
+    detect_introduced_block_markdown,
     detect_prefixed_wrapper,
     detect_suffixed_wrapper,
     detect_wrapped_chat_answer,
@@ -56,6 +58,80 @@ class ValidateChunkOutputTests(unittest.TestCase):
 
     def test_original_invitation_content_is_allowed(self) -> None:
         validate_chunk_output("如果你愿意，这句话本身就是原文。", "如果你愿意，这句话本身就是原文，并略作润色。", "p0_c0")
+
+
+class RelaxedValidationTests(unittest.TestCase):
+    def test_inline_bold_within_tolerance_is_allowed(self) -> None:
+        input_text = "本文档介绍系统的核心模块以及它们之间的依赖关系。"
+        output_text = "本文档介绍系统的**核心模块**以及它们之间的**依赖关系**。"
+        validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_inline_bold_when_input_already_has_emphasis(self) -> None:
+        input_text = "**关键术语**指的是出现在词汇表中的条目。"
+        output_text = "**关键术语**指的是**词汇表**中明确收录的**条目**。"
+        validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_excessive_inline_bold_is_rejected(self) -> None:
+        input_text = "简短一句话。"
+        output_text = "".join(f"**关键{i}**" for i in range(INLINE_BOLD_TOLERANCE + 3))
+        with self.assertRaisesRegex(ValueError, "introduced excessive inline emphasis"):
+            validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_block_heading_is_rejected_when_not_in_input(self) -> None:
+        input_text = "本节描述系统行为。"
+        output_text = "## 标题\n\n本节描述系统行为，更自然一些。"
+        with self.assertRaisesRegex(ValueError, "introduced block-level markdown formatting"):
+            validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_block_heading_allowed_when_input_already_has_heading_marker(self) -> None:
+        input_text = "## 系统行为\n\n本节描述系统行为。"
+        output_text = "## 系统行为\n\n本节描述系统行为，并补充了说明。"
+        validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_block_blockquote_is_rejected_when_not_in_input(self) -> None:
+        input_text = "这只是一段普通的正文，没有任何引用结构。"
+        output_text = "> 这只是一段普通的正文，没有任何引用结构。"
+        with self.assertRaisesRegex(ValueError, "introduced block-level markdown formatting"):
+            validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_inline_greater_than_sign_is_allowed(self) -> None:
+        input_text = "性能指标 p99 延迟。"
+        output_text = "性能指标 p99 延迟 > 200ms 时触发告警。"
+        validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_bullet_bold_prefix_is_rejected_when_not_in_input(self) -> None:
+        input_text = "支持两种模式：默认模式和高级模式。"
+        output_text = "支持两种模式。\n- **默认模式**：开箱即用\n- **高级模式**：可调参数"
+        with self.assertRaisesRegex(ValueError, "introduced block-level markdown formatting"):
+            validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_short_input_modest_expansion_is_allowed(self) -> None:
+        input_text = "他来了。"
+        output_text = "他终于在傍晚时分赶到了现场，比预定的时间晚了大约半小时。"
+        validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_extreme_expansion_is_still_rejected(self) -> None:
+        input_text = "他来了。"
+        output_text = "他来了。" + "随后场面陷入混乱，所有人都在等待解释。" * 80
+        with self.assertRaisesRegex(ValueError, "expanded abnormally"):
+            validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_long_prose_within_threex_is_allowed(self) -> None:
+        input_text = "本系统采用模块化设计，包含数据接入、特征工程、模型训练、推理服务、监控告警等组件，能够支持端到端的机器学习生命周期管理。" * 4
+        output_text = "本平台采用模块化架构，覆盖数据接入、特征工程、模型训练、推理服务和监控告警等环节，可支撑完整的机器学习生命周期管理工作。" * 4
+        validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_detect_introduced_block_markdown_returns_first_new_marker(self) -> None:
+        self.assertIsNone(detect_introduced_block_markdown("普通正文", "改写后的普通正文。"))
+        self.assertIsNone(detect_introduced_block_markdown("## 已有标题\n正文", "## 已有标题\n改写后的正文"))
+        self.assertEqual(
+            detect_introduced_block_markdown("普通正文", "## 新标题\n改写后的正文"),
+            "## ",
+        )
+        self.assertEqual(
+            detect_introduced_block_markdown("普通正文", "> 改写后的正文"),
+            "> ",
+        )
 
 
 class DetectAnswerStylePatternTests(unittest.TestCase):

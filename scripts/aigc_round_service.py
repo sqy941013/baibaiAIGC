@@ -80,6 +80,50 @@ SUFFIX_WRAPPER_PATTERNS = (
 
 ANSWER_STYLE_ERROR_MARKER = "contains disallowed answer-style pattern"
 
+BLOCK_MARKDOWN_PATTERNS = ("# ", "## ", "### ", "#### ", "##### ", "- **", "> ")
+INLINE_BOLD_PATTERN = "**"
+INLINE_BOLD_TOLERANCE = 4
+
+LENGTH_EXPANSION_MULTIPLIER = 3
+LENGTH_EXPANSION_HEADROOM = 500
+
+
+def _strip_block_indent(line: str) -> str:
+    stripped = line.lstrip(" ")
+    if len(line) - len(stripped) > 3:
+        return line
+    return stripped
+
+
+def _line_starts_with_block_marker(line: str) -> str | None:
+    stripped = _strip_block_indent(line)
+    for marker in BLOCK_MARKDOWN_PATTERNS:
+        if stripped.startswith(marker):
+            return marker
+    return None
+
+
+def _block_markers_present(text: str) -> set[str]:
+    markers: set[str] = set()
+    for line in text.splitlines():
+        marker = _line_starts_with_block_marker(line)
+        if marker is not None:
+            markers.add(marker)
+    return markers
+
+
+def detect_introduced_block_markdown(input_text: str, output_text: str) -> str | None:
+    input_markers = _block_markers_present(input_text)
+    for line in output_text.splitlines():
+        marker = _line_starts_with_block_marker(line)
+        if marker is not None and marker not in input_markers:
+            return marker
+    return None
+
+
+def _count_inline_bold(text: str) -> int:
+    return text.count(INLINE_BOLD_PATTERN) // 2
+
 
 def validate_chunk_output(input_text: str, output_text: str, chunk_id: str) -> None:
     normalized_output = output_text.strip()
@@ -90,11 +134,25 @@ def validate_chunk_output(input_text: str, output_text: str, chunk_id: str) -> N
     if answer_style_pattern is not None:
         raise ValueError(f"Chunk {chunk_id} contains disallowed answer-style pattern: {answer_style_pattern}")
 
-    markdown_markers = ("**", "### ", "## ", "- **", "> ")
-    if any(marker in normalized_output for marker in markdown_markers) and not any(marker in input_text for marker in markdown_markers):
-        raise ValueError(f"Chunk {chunk_id} introduced markdown-style formatting")
+    introduced_block_marker = detect_introduced_block_markdown(input_text, normalized_output)
+    if introduced_block_marker is not None:
+        raise ValueError(
+            f"Chunk {chunk_id} introduced block-level markdown formatting: {introduced_block_marker.strip()!r}"
+        )
 
-    if len(normalized_output) > max(len(input_text) * 2, len(input_text) + 200):
+    input_bold = _count_inline_bold(input_text)
+    output_bold = _count_inline_bold(normalized_output)
+    if output_bold > input_bold + INLINE_BOLD_TOLERANCE:
+        raise ValueError(
+            f"Chunk {chunk_id} introduced excessive inline emphasis: "
+            f"{output_bold - input_bold} new ** spans (tolerance {INLINE_BOLD_TOLERANCE})"
+        )
+
+    max_length = max(
+        len(input_text) * LENGTH_EXPANSION_MULTIPLIER,
+        len(input_text) + LENGTH_EXPANSION_HEADROOM,
+    )
+    if len(normalized_output) > max_length:
         raise ValueError(f"Chunk {chunk_id} expanded abnormally; possible answer-style drift")
 
 
