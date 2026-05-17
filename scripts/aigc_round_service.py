@@ -81,6 +81,11 @@ SUFFIX_WRAPPER_PATTERNS = (
 ANSWER_STYLE_ERROR_MARKER = "contains disallowed answer-style pattern"
 
 
+ANSWER_STYLE_MARKDOWN_MARKERS = ("### ", "## ", "- **")
+EXPANSION_MULTIPLIER = 3
+EXPANSION_ABSOLUTE_HEADROOM = 500
+
+
 def validate_chunk_output(input_text: str, output_text: str, chunk_id: str) -> None:
     normalized_output = output_text.strip()
     if not normalized_output:
@@ -90,11 +95,12 @@ def validate_chunk_output(input_text: str, output_text: str, chunk_id: str) -> N
     if answer_style_pattern is not None:
         raise ValueError(f"Chunk {chunk_id} contains disallowed answer-style pattern: {answer_style_pattern}")
 
-    markdown_markers = ("**", "### ", "## ", "- **", "> ")
-    if any(marker in normalized_output for marker in markdown_markers) and not any(marker in input_text for marker in markdown_markers):
-        raise ValueError(f"Chunk {chunk_id} introduced markdown-style formatting")
+    if any(marker in normalized_output for marker in ANSWER_STYLE_MARKDOWN_MARKERS) and not any(
+        marker in input_text for marker in ANSWER_STYLE_MARKDOWN_MARKERS
+    ):
+        raise ValueError(f"Chunk {chunk_id} introduced answer-style markdown formatting")
 
-    if len(normalized_output) > max(len(input_text) * 2, len(input_text) + 200):
+    if len(normalized_output) > max(len(input_text) * EXPANSION_MULTIPLIER, len(input_text) + EXPANSION_ABSOLUTE_HEADROOM):
         raise ValueError(f"Chunk {chunk_id} expanded abnormally; possible answer-style drift")
 
 

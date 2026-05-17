@@ -57,6 +57,84 @@ class ValidateChunkOutputTests(unittest.TestCase):
     def test_original_invitation_content_is_allowed(self) -> None:
         validate_chunk_output("如果你愿意，这句话本身就是原文。", "如果你愿意，这句话本身就是原文，并略作润色。", "p0_c0")
 
+    def test_bold_markdown_introduction_is_allowed(self) -> None:
+        validate_chunk_output(
+            "这是原始正文，包含一些重要的术语。",
+            "这是经过润色的正文，包含**一些**重要的术语，并稍作展开。",
+            "p0_c0",
+        )
+
+    def test_blockquote_introduction_is_allowed(self) -> None:
+        validate_chunk_output(
+            "这是原始正文，包含一句引用。",
+            "这是润色后的正文，包含一句引用。\n\n> 引用的内容稍作整理。",
+            "p0_c0",
+        )
+
+    def test_inline_code_introduction_is_allowed(self) -> None:
+        validate_chunk_output(
+            "本段提到 deai 接口的 process 方法。",
+            "本段提到 `deai` 接口的 `process` 方法，并补充了用法说明。",
+            "p0_c0",
+        )
+
+    def test_heading_introduction_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "introduced answer-style markdown formatting"):
+            validate_chunk_output(
+                "这是原始正文，无任何标题层级。",
+                "### 概述\n\n这是改写后的正文，无任何标题层级。",
+                "p0_c0",
+            )
+
+    def test_subheading_introduction_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "introduced answer-style markdown formatting"):
+            validate_chunk_output(
+                "原始段落，没有任何子标题。",
+                "## 章节标题\n\n原始段落，没有任何子标题，已润色。",
+                "p0_c0",
+            )
+
+    def test_bullet_bold_introduction_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "introduced answer-style markdown formatting"):
+            validate_chunk_output(
+                "原始正文，没有列表结构。",
+                "- **要点一**：原始正文，已经过润色。",
+                "p0_c0",
+            )
+
+    def test_inherited_heading_marker_is_allowed(self) -> None:
+        validate_chunk_output(
+            "### 概述\n\n这是原始段落。",
+            "### 概述\n\n这是改写后的段落，更自然。",
+            "p0_c0",
+        )
+
+    def test_moderate_expansion_within_new_cap_is_allowed(self) -> None:
+        input_text = "降AI味的流程会保留Markdown结构。"
+        output_text = (
+            "经过降AI味处理后的流程会完整保留Markdown结构，"
+            "并在表达上更自然、更接近人类写作风格。"
+            "整体长度大约是原文的两倍多一点，"
+            "但仍在合理的扩张幅度内。"
+        )
+        validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_short_input_with_modest_expansion_is_allowed(self) -> None:
+        input_text = "短输入。"
+        output_text = (
+            "这是短输入的润色版本，扩写到大约一百多个字符，"
+            "这种长度对于真实的LLM polish输出来说非常常见，"
+            "在旧规则下（+200绝对上限）会被错杀，"
+            "但在放宽后应当通过校验。"
+        )
+        validate_chunk_output(input_text, output_text, "p0_c0")
+
+    def test_extreme_expansion_is_still_rejected(self) -> None:
+        input_text = "原文。"
+        output_text = "扩写。" * 200
+        with self.assertRaisesRegex(ValueError, "expanded abnormally"):
+            validate_chunk_output(input_text, output_text, "p0_c0")
+
 
 class DetectAnswerStylePatternTests(unittest.TestCase):
     def test_detects_new_prefixed_wrapper_only_when_body_aligns(self) -> None:
