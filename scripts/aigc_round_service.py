@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -86,6 +87,18 @@ INLINE_BOLD_TOLERANCE = 4
 
 LENGTH_EXPANSION_MULTIPLIER = 3
 LENGTH_EXPANSION_HEADROOM = 500
+
+THINK_CONTENT_PATTERNS = (
+    re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE),
+    re.compile(r"<thinking>[\s\S]*?</thinking>", re.IGNORECASE),
+    re.compile(r"<\/?think>", re.IGNORECASE),
+)
+
+
+def strip_think_content(text: str) -> str:
+    for pattern in THINK_CONTENT_PATTERNS:
+        text = pattern.sub("", text)
+    return text
 
 
 def _strip_block_indent(line: str) -> str:
@@ -334,6 +347,7 @@ def _rewrite_chunk_with_validation(
 ) -> str:
     prompt_input = build_prompt_input(prompt_text, chunk_text, round_number, chunk_id)
     chunk_output = transform(chunk_text, prompt_input, round_number, chunk_id)
+    chunk_output = strip_think_content(chunk_output)
     try:
         validate_chunk_output(chunk_text, chunk_output, chunk_id)
         return chunk_output
@@ -349,6 +363,7 @@ def _rewrite_chunk_with_validation(
         extra_contract=RETRY_OUTPUT_CONTRACT,
     )
     retry_output = transform(chunk_text, retry_prompt_input, round_number, chunk_id)
+    retry_output = strip_think_content(retry_output)
     validate_chunk_output(chunk_text, retry_output, chunk_id)
     return retry_output
 
