@@ -161,9 +161,17 @@ python scripts/run_aigc_round.py <doc_id> <round> <input_path> <output_path> <ma
 - `model`
 - `base_url`
 
-可以通过环境变量提供：
+可以通过环境变量提供。变量名按优先级解析：`MINIMAX_*` → `BAIBAIAIGC_*` → `OPENAI_*`，三组互为别名，命中即停止。`MINIMAX_*` 是部署独立 Minimax 接入的推荐写法，`BAIBAIAIGC_*` 是项目内通用名，`OPENAI_*` 是 OpenAI 兼容接入的标准名。
 
 ```powershell
+# Minimax Coding Plan（OpenAI 兼容端点）示例
+$env:MINIMAX_API_KEY="your-minimax-coding-plan-key"
+$env:MINIMAX_MODEL="MiniMax-M2.7-highspeed"
+$env:MINIMAX_BASE_URL="https://api.minimaxi.com/v1"
+```
+
+```powershell
+# 通用 / 旧变量名
 $env:BAIBAIAIGC_API_KEY="your_api_key"
 $env:BAIBAIAIGC_MODEL="your_model"
 $env:BAIBAIAIGC_BASE_URL="https://your-endpoint/v1"
@@ -225,9 +233,10 @@ python scripts/run_aigc_round.py origin/毕业论文_原始_utf8.txt 1 origin/�
 
 解决方法：
 
-- 配置 `BAIBAIAIGC_API_KEY`
-- 配置 `BAIBAIAIGC_MODEL`
-- 配置 `BAIBAIAIGC_BASE_URL`
+- 任选一组前缀，三组互为别名：
+  - `MINIMAX_API_KEY` / `MINIMAX_MODEL` / `MINIMAX_BASE_URL`（Minimax 接入推荐）
+  - `BAIBAIAIGC_API_KEY` / `BAIBAIAIGC_MODEL` / `BAIBAIAIGC_BASE_URL`（通用 / 旧名）
+  - `OPENAI_API_KEY` / `OPENAI_BASE_URL`（OpenAI 兼容标准名，`model` 仍需另外指定）
 
 或者使用 `--dry-run` 只做切块校验。
 

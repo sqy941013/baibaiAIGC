@@ -53,17 +53,30 @@ def _resolve_api_config(payload: dict) -> tuple[str | None, str | None, str | No
     """Resolve API credentials with fallback chain.
 
     Priority order:
-    1. Request body parameters (``payload``)
-    2. Environment variables (handled by :func:`read_api_config`)
+    1. Container-side environment variables, *if* they fully configure a
+       provider (any of ``MINIMAX_*`` / ``BAIBAIAIGC_*`` / ``OPENAI_*``
+       covering api_key + model + base_url). When the deai container is
+       set up with its own LLM provider, payload-forwarded credentials
+       from the caller are ignored, so polish always runs against the
+       operator's chosen provider regardless of what the upstream
+       service uses.
+    2. Otherwise, request body parameters (``payload``) — the upstream
+       service may forward its own credentials to keep deai polish on
+       the same model as the inline path. Missing fields fall back to
+       the partial env values resolved by :func:`read_api_config`.
     3. ``~/.baibaiaigc/config.json`` via :func:`load_app_config`
-       (maps ``baseUrl`` / ``apiKey`` / ``model`` / ``apiType``)
+       (maps ``baseUrl`` / ``apiKey`` / ``model`` / ``apiType``).
     """
-    api_key = payload.get("api_key") or payload.get("apiKey")
-    model = payload.get("model")
-    base_url = payload.get("base_url") or payload.get("baseUrl")
-    api_type = payload.get("api_type") or payload.get("apiType")
+    env_api_key, env_model, env_base_url, env_api_type = read_api_config(
+        None, None, None, None,
+    )
+    if env_api_key and env_model and env_base_url:
+        return env_api_key, env_model, env_base_url, env_api_type
 
-    api_key, model, base_url, api_type = read_api_config(api_key, model, base_url, api_type)
+    api_key = payload.get("api_key") or payload.get("apiKey") or env_api_key
+    model = payload.get("model") or env_model
+    base_url = payload.get("base_url") or payload.get("baseUrl") or env_base_url
+    api_type = payload.get("api_type") or payload.get("apiType") or env_api_type
 
     if not (api_key and model and base_url) and get_app_config_path().exists():
         try:

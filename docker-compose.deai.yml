@@ -19,10 +19,28 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # LLM API configuration (can also be passed per-request in the JSON body).
-      # BAIBAIAIGC_API_KEY: "${DEAI_API_KEY:-}"
-      # BAIBAIAIGC_MODEL: "${DEAI_MODEL:-}"
-      # BAIBAIAIGC_BASE_URL: "${DEAI_BASE_URL:-}"
+      # LLM API configuration. Two ways to drive it:
+      #
+      # 1. Pre-configure the container with its own provider via env vars.
+      #    When all three of api_key / model / base_url are set, the
+      #    deai service uses them exclusively and IGNORES any credentials
+      #    forwarded in the request body. Recommended when the deai
+      #    service should run on a dedicated provider (e.g. Minimax
+      #    Coding Plan) independent of the upstream caller.
+      #
+      #    Minimax (OpenAI-compatible) example:
+      #      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
+      #      MINIMAX_MODEL: "${MINIMAX_MODEL:-MiniMax-M2.7-highspeed}"
+      #      MINIMAX_BASE_URL: "${MINIMAX_BASE_URL:-https://api.minimaxi.com/v1}"
+      #
+      #    Generic / legacy variable names (still supported):
+      #      BAIBAIAIGC_API_KEY: "${DEAI_API_KEY:-}"
+      #      BAIBAIAIGC_MODEL: "${DEAI_MODEL:-}"
+      #      BAIBAIAIGC_BASE_URL: "${DEAI_BASE_URL:-}"
+      #
+      # 2. Leave env vars empty and pass api_key / model / base_url
+      #    per request in the JSON body — useful when the caller wants
+      #    polish to share the upstream service's active LLM profile.
       PORT: "8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
