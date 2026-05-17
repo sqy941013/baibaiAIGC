@@ -160,6 +160,18 @@ def is_answer_style_validation_error(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and ANSWER_STYLE_ERROR_MARKER in str(exc)
 
 
+def is_inline_emphasis_validation_error(exc: Exception) -> bool:
+    return isinstance(exc, ValueError) and "introduced excessive inline emphasis" in str(exc)
+
+
+def is_length_expansion_validation_error(exc: Exception) -> bool:
+    return isinstance(exc, ValueError) and "expanded abnormally" in str(exc)
+
+
+def is_retryable_validation_error(exc: Exception) -> bool:
+    return is_answer_style_validation_error(exc) or is_inline_emphasis_validation_error(exc) or is_length_expansion_validation_error(exc)
+
+
 def _normalize_text_for_wrapper_detection(text: str) -> str:
     return text.strip()
 
@@ -326,7 +338,7 @@ def _rewrite_chunk_with_validation(
         validate_chunk_output(chunk_text, chunk_output, chunk_id)
         return chunk_output
     except Exception as exc:
-        if not is_answer_style_validation_error(exc):
+        if not is_retryable_validation_error(exc):
             raise
 
     retry_prompt_input = build_prompt_input(
