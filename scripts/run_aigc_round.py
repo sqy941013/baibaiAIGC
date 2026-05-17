@@ -39,12 +39,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("manifest_path", type=Path, help="Manifest json output path")
     parser.add_argument("--chunk-limit", type=int, default=DEFAULT_CHUNK_LIMIT)
     parser.add_argument("--score-total", type=int, default=None)
-    parser.add_argument("--api-key", default=None, help="LLM API key. Defaults to BAIBAIAIGC_API_KEY or OPENAI_API_KEY.")
-    parser.add_argument("--model", default=None, help="LLM model name. Defaults to BAIBAIAIGC_MODEL.")
+    parser.add_argument("--api-key", default=None, help="LLM API key. Defaults to MINIMAX_API_KEY / BAIBAIAIGC_API_KEY / OPENAI_API_KEY.")
+    parser.add_argument("--model", default=None, help="LLM model name. Defaults to MINIMAX_MODEL / BAIBAIAIGC_MODEL.")
     parser.add_argument(
         "--base-url",
         default=None,
-        help="OpenAI-compatible base URL or chat/completions endpoint. Defaults to BAIBAIAIGC_BASE_URL or OPENAI_BASE_URL.",
+        help="OpenAI-compatible base URL or chat/completions endpoint. Defaults to MINIMAX_BASE_URL / BAIBAIAIGC_BASE_URL / OPENAI_BASE_URL.",
     )
     parser.add_argument("--api-type", default=None, help="API type: chat_completions or responses.")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature for API mode.")

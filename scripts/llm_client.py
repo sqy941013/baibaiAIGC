@@ -346,14 +346,28 @@ def read_api_config(
     base_url: str | None,
     api_type: str | None = None,
 ) -> tuple[str | None, str | None, str | None, str | None]:
-    resolved_api_key = api_key or os.getenv("BAIBAIAIGC_API_KEY") or os.getenv("OPENAI_API_KEY")
-    resolved_model = model or os.getenv("BAIBAIAIGC_MODEL")
+    resolved_api_key = (
+        api_key
+        or os.getenv("MINIMAX_API_KEY")
+        or os.getenv("BAIBAIAIGC_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+    resolved_model = (
+        model
+        or os.getenv("MINIMAX_MODEL")
+        or os.getenv("BAIBAIAIGC_MODEL")
+    )
     resolved_base_url = (
         base_url
+        or os.getenv("MINIMAX_BASE_URL")
         or os.getenv("BAIBAIAIGC_BASE_URL")
         or os.getenv("OPENAI_BASE_URL")
     )
-    resolved_api_type = api_type or os.getenv("BAIBAIAIGC_API_TYPE")
+    resolved_api_type = (
+        api_type
+        or os.getenv("MINIMAX_API_TYPE")
+        or os.getenv("BAIBAIAIGC_API_TYPE")
+    )
     return resolved_api_key, resolved_model, resolved_base_url, resolved_api_type
 
 
