@@ -23,11 +23,26 @@ SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from markdown_chunks import detect_markdown_blocks, process_text_blocks  # noqa: E402
-from aigc_round_service import run_round  # noqa: E402
+from aigc_records import ROOT_DIR  # noqa: E402
+from aigc_round_service import PROMPT_PROFILES, run_round  # noqa: E402
 from llm_client import llm_completion, read_api_config  # noqa: E402
 from app_config import get_app_config_path, load_app_config  # noqa: E402
 
 app = Flask(__name__)
+
+
+def _expected_prompt_paths() -> list[Path]:
+    """Absolute paths of every prompt file declared in PROMPT_PROFILES."""
+    seen: dict[str, Path] = {}
+    for prompts in PROMPT_PROFILES.values():
+        for relative in prompts.values():
+            absolute = (ROOT_DIR / relative).resolve()
+            seen[str(absolute)] = absolute
+    return list(seen.values())
+
+
+def _missing_prompt_paths() -> list[Path]:
+    return [path for path in _expected_prompt_paths() if not path.is_file()]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -230,8 +245,16 @@ def process_deai(
 # ---------------------------------------------------------------------------
 
 @app.route("/health", methods=["GET"])
-def health() -> Response:
-    return jsonify({"status": "ok", "service": "deai"})
+def health() -> tuple[Response, int]:
+    missing = _missing_prompt_paths()
+    if missing:
+        return jsonify({
+            "service": "deai",
+            "status": "unhealthy",
+            "reason": "prompt files missing",
+            "missing_prompts": [str(p.relative_to(ROOT_DIR)) for p in missing],
+        }), 503
+    return jsonify({"status": "ok", "service": "deai"}), 200
 
 
 @app.route("/api/deai/process", methods=["POST"])
@@ -319,6 +342,14 @@ def deai_process() -> tuple[Response, int]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    missing = _missing_prompt_paths()
+    if missing:
+        rendered = ", ".join(str(p.relative_to(ROOT_DIR)) for p in missing)
+        print(
+            f"Deai API server cannot start: missing prompt files: {rendered}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     port = int(os.environ.get("PORT", 8000))
     print(f"Deai API server starting on port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
