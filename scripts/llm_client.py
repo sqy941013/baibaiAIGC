@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-from urllib import error, request
+import time
+
+import requests
 
 
 DEFAULT_HEADERS = {
@@ -12,6 +14,7 @@ DEFAULT_HEADERS = {
     "User-Agent": "curl/8.7.1",
 }
 ERROR_BODY_PREVIEW_LIMIT = 240
+MAX_TIMEOUT_RETRIES = 2
 
 
 class LLMClientError(RuntimeError):
@@ -92,10 +95,9 @@ def _preview_response_body(response_body: str) -> str:
     return f"{compact[:ERROR_BODY_PREVIEW_LIMIT]}..."
 
 
-def _raise_http_error(exc: error.HTTPError, api_type: str | None) -> None:
-    detail = exc.read().decode("utf-8", errors="replace")
-    status_code = int(exc.code)
-    preview = _preview_response_body(detail)
+def _raise_http_error(response: requests.Response, api_type: str | None) -> None:
+    preview = _preview_response_body(response.text)
+    status_code = response.status_code
     raise LLMClientError(
         f"LLM request failed with status {status_code}: {preview}",
         code="provider_http_error",
@@ -104,7 +106,7 @@ def _raise_http_error(exc: error.HTTPError, api_type: str | None) -> None:
         provider_status=status_code,
         api_type=api_type,
         detail=preview,
-    ) from exc
+    )
 
 
 def _load_json_response(
@@ -232,6 +234,16 @@ def extract_response_text(data: dict[str, object], response_body: str, api_type:
         ) from exc
 
 
+_http_session = None
+
+
+def _get_session() -> requests.Session:
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+    return _http_session
+
+
 def _request_llm_json(
     payload: dict[str, object],
     *,
@@ -242,44 +254,59 @@ def _request_llm_json(
 ) -> tuple[dict[str, object], int, str, str, str]:
     resolved_api_type = normalize_api_type(api_type, base_url)
     endpoint = build_endpoint(base_url, resolved_api_type)
-    body = json.dumps(payload).encode("utf-8")
 
-    http_request = request.Request(
-        endpoint,
-        data=body,
-        headers=build_headers(api_key),
-        method="POST",
-    )
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_TIMEOUT_RETRIES + 1):
+        try:
+            response = _get_session().post(
+                endpoint,
+                json=payload,
+                headers=build_headers(api_key),
+                timeout=timeout,
+            )
+            if response.status_code >= 400:
+                _raise_http_error(response, resolved_api_type)
 
-    try:
-        with request.urlopen(http_request, timeout=timeout) as response:
-            response_body = response.read().decode("utf-8", errors="replace")
-            status_code = int(getattr(response, "status", 200) or 200)
-            content_type = str(response.headers.get("Content-Type", "") or "")
-    except error.HTTPError as exc:
-        _raise_http_error(exc, resolved_api_type)
-    except error.URLError as exc:
-        raise LLMClientError(
-            f"LLM request failed: {exc.reason}",
-            code="provider_network_error",
-            stage="llm_http",
-            retriable=True,
-            api_type=resolved_api_type,
-            detail=str(exc.reason),
-        ) from exc
+            response_body = response.text
+            status_code = response.status_code
+            content_type = response.headers.get("Content-Type", "")
 
-    return (
-        _load_json_response(
-            response_body,
-            status_code=status_code,
-            content_type=content_type,
-            api_type=resolved_api_type,
-        ),
-        status_code,
-        endpoint,
-        resolved_api_type,
-        response_body,
-    )
+            return (
+                _load_json_response(
+                    response_body,
+                    status_code=status_code,
+                    content_type=content_type,
+                    api_type=resolved_api_type,
+                ),
+                status_code,
+                endpoint,
+                resolved_api_type,
+                response_body,
+            )
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            if attempt < MAX_TIMEOUT_RETRIES:
+                delay = 2 ** attempt
+                time.sleep(delay)
+            continue
+        except requests.exceptions.RequestException as exc:
+            raise LLMClientError(
+                f"LLM request failed: {exc}",
+                code="provider_network_error",
+                stage="llm_http",
+                retriable=True,
+                api_type=resolved_api_type,
+                detail=str(exc),
+            ) from exc
+
+    raise LLMClientError(
+        f"LLM request timed out after {MAX_TIMEOUT_RETRIES} retries",
+        code="provider_timeout",
+        stage="llm_http",
+        retriable=False,
+        api_type=resolved_api_type,
+        detail=str(last_exc),
+    ) from last_exc
 
 
 def llm_completion(

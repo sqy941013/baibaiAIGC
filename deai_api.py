@@ -285,7 +285,7 @@ def deai_process() -> tuple[Response, int]:
         "api_type": null,           // optional: "chat_completions" or "responses"
         "temperature": 0.7,         // optional
         "chunk_limit": 850,         // optional
-        "timeout": 120,             // optional, per-chunk LLM timeout
+        "timeout": 120,             // optional, per-chunk LLM timeout (default: DEAI_LLM_TIMEOUT env or 300s)
         "dry_run": false            // optional, skip LLM for testing
     }
     """
@@ -301,7 +301,7 @@ def deai_process() -> tuple[Response, int]:
     prompt_profile = payload.get("prompt_profile", "cn")
     temperature = float(payload.get("temperature", 0.7))
     chunk_limit = int(payload.get("chunk_limit", 850))
-    timeout = int(payload.get("timeout", 120))
+    timeout = int(payload.get("timeout", int(os.environ.get("DEAI_LLM_TIMEOUT", 300))))
     dry_run = bool(payload.get("dry_run"))
 
     # en profile only supports 1 round
