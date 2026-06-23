@@ -238,7 +238,7 @@ def _request_llm_json(
     api_key: str,
     base_url: str,
     api_type: str | None,
-    timeout: int,
+    timeout: int | None,
 ) -> tuple[dict[str, object], int, str, str, str]:
     resolved_api_type = normalize_api_type(api_type, base_url)
     endpoint = build_endpoint(base_url, resolved_api_type)
@@ -290,7 +290,7 @@ def llm_completion(
     base_url: str,
     api_type: str | None = None,
     temperature: float = 0.7,
-    timeout: int = 120,
+    timeout: int | None = None,
 ) -> str:
     payload = build_payload(
         prompt,

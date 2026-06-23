@@ -203,6 +203,7 @@ def process_text_blocks(
     prompt_profile: str,
     round_number: int,
     chunk_limit: int,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> str:
     """Process only the non-preserved blocks through the chunking pipeline.
 
@@ -214,7 +215,7 @@ def process_text_blocks(
 
     results: list[str] = []
 
-    for block in blocks:
+    for block_index, block in enumerate(blocks, start=1):
         if block.preserved:
             results.append(block.text)
             continue
@@ -222,6 +223,15 @@ def process_text_blocks(
         if not block.text.strip():
             results.append(block.text)
             continue
+
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "markdown-block-start",
+                "round": round_number,
+                "blockIndex": block_index,
+                "totalBlocks": len(blocks),
+                "blockType": block.block_type,
+            })
 
         # Run the standard chunking pipeline on this text block
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -242,8 +252,18 @@ def process_text_blocks(
                 transform=transform,
                 prompt_profile=prompt_profile,
                 chunk_limit=chunk_limit,
+                progress_callback=progress_callback,
             )
 
             results.append(output_path.read_text(encoding="utf-8"))
+
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "markdown-block-complete",
+                "round": round_number,
+                "blockIndex": block_index,
+                "totalBlocks": len(blocks),
+                "blockType": block.block_type,
+            })
 
     return "\n".join(results)

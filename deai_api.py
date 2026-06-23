@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import sys
 import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +33,11 @@ from llm_client import llm_completion, read_api_config  # noqa: E402
 from app_config import get_app_config_path, load_app_config  # noqa: E402
 
 app = Flask(__name__)
+
+DEFAULT_LLM_TIMEOUT_SECONDS = None
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15
+_JOBS: dict[str, dict[str, Any]] = {}
+_JOBS_LOCK = threading.Lock()
 
 
 def _expected_prompt_paths() -> list[Path]:
@@ -97,19 +106,83 @@ def _build_transform(
     base_url: str,
     api_type: str | None,
     temperature: float,
-    timeout: int,
+    timeout: int | None,
+    progress_callback: Any | None = None,
+    heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
 ):
     """Return a transform(chunk_text, prompt_input, round_number, chunk_id) -> str."""
     def transform(chunk_text: str, prompt_input: str, round_number: int, chunk_id: str) -> str:
-        return llm_completion(
-            prompt_input,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            api_type=api_type,
-            temperature=temperature,
-            timeout=timeout,
-        )
+        if progress_callback is None:
+            return llm_completion(
+                prompt_input,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                api_type=api_type,
+                temperature=temperature,
+                timeout=timeout,
+            )
+
+        progress_callback({
+            "phase": "llm-request-start",
+            "round": round_number,
+            "chunkId": chunk_id,
+            "timeout": timeout or 0,
+            "model": model,
+        })
+        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+        def call_llm() -> None:
+            try:
+                result_queue.put((
+                    "ok",
+                    llm_completion(
+                        prompt_input,
+                        model=model,
+                        api_key=api_key,
+                        base_url=base_url,
+                        api_type=api_type,
+                        temperature=temperature,
+                        timeout=timeout,
+                    ),
+                ))
+            except Exception as exc:  # noqa: BLE001 - propagate original error to caller.
+                result_queue.put(("error", exc))
+
+        worker = threading.Thread(target=call_llm, daemon=True)
+        worker.start()
+        started_at = time.time()
+        while True:
+            try:
+                status, value = result_queue.get(timeout=max(1, heartbeat_interval))
+                break
+            except queue.Empty:
+                progress_callback({
+                    "phase": "llm-request-waiting",
+                    "round": round_number,
+                    "chunkId": chunk_id,
+                    "elapsedSeconds": round(time.time() - started_at, 1),
+                    "timeout": timeout or 0,
+                    "model": model,
+                })
+
+        if status == "error":
+            progress_callback({
+                "phase": "llm-request-error",
+                "round": round_number,
+                "chunkId": chunk_id,
+                "elapsedSeconds": round(time.time() - started_at, 1),
+                "error": str(value),
+            })
+            raise value
+
+        progress_callback({
+            "phase": "llm-request-complete",
+            "round": round_number,
+            "chunkId": chunk_id,
+            "elapsedSeconds": round(time.time() - started_at, 1),
+        })
+        return str(value)
     return transform
 
 
@@ -130,6 +203,166 @@ def _markdown_structural_markers(text: str) -> dict[str, int]:
         "horizontal_rules": len(re.findall(r"^---+$", text, re.MULTILINE))
                            + len(re.findall(r"^\*\*\*+$", text, re.MULTILINE)),
     }
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            return max(minimum, int(raw))
+        except ValueError:
+            app.logger.warning("Invalid %s=%r, using default %s", name, raw, default)
+    return default
+
+
+def _optional_timeout_value(value: Any, default: int | None) -> int | None:
+    raw = "" if value is None else str(value).strip().lower()
+    if raw in {"0", "false", "no", "none", "off", "disabled", "disable"}:
+        return None
+    if raw:
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _payload_timeout(payload: dict) -> int | None:
+    raw = payload.get("timeout")
+    if raw in (None, ""):
+        return _optional_timeout_value(
+            os.environ.get("DEAI_LLM_TIMEOUT"),
+            DEFAULT_LLM_TIMEOUT_SECONDS,
+        )
+    return _optional_timeout_value(
+        raw,
+        _optional_timeout_value(os.environ.get("DEAI_LLM_TIMEOUT"), DEFAULT_LLM_TIMEOUT_SECONDS),
+    )
+
+
+def _heartbeat_interval() -> int:
+    return _env_int("DEAI_HEARTBEAT_INTERVAL_SECONDS", DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _update_job(job_id: str, **fields: Any) -> None:
+    now = _now()
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return
+        job.update(fields)
+        job["updated_at"] = now
+        if fields.get("heartbeat", True):
+            job["last_heartbeat_at"] = now
+        job.pop("heartbeat", None)
+
+
+def _job_snapshot(job_id: str) -> dict[str, Any] | None:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return None
+        data = dict(job)
+    if data.get("status") != "completed":
+        data.pop("content", None)
+    return data
+
+
+def _progress_callback_for_job(job_id: str):
+    def capture(event: dict[str, Any]) -> None:
+        phase = str(event.get("phase") or "running")
+        _update_job(
+            job_id,
+            status="running",
+            phase=phase,
+            progress=event,
+            heartbeat=True,
+        )
+
+    return capture
+
+
+def _run_deai_job(job_id: str, payload: dict[str, Any]) -> None:
+    _update_job(job_id, status="running", phase="resolving-config", heartbeat=True)
+    content = payload["content"]
+    rounds = int(payload.get("rounds", 2))
+    prompt_profile = payload.get("prompt_profile", "cn")
+    temperature = float(payload.get("temperature", 0.7))
+    chunk_limit = int(payload.get("chunk_limit", 850))
+    timeout = _payload_timeout(payload)
+    dry_run = bool(payload.get("dry_run"))
+
+    if prompt_profile == "en" and rounds > 1:
+        rounds = 1
+
+    try:
+        if dry_run:
+            result = process_deai(
+                content,
+                rounds=rounds,
+                prompt_profile=prompt_profile,
+                api_key="",
+                model="",
+                base_url="",
+                dry_run=True,
+                progress_callback=_progress_callback_for_job(job_id),
+            )
+        else:
+            api_key, model, base_url, api_type = _resolve_api_config(payload)
+            if not (api_key and model and base_url):
+                raise ValueError(
+                    "API mode requires api_key, model, and base_url "
+                    "(via request body, environment variables, or ~/.baibaiaigc/config.json)."
+                )
+            result = process_deai(
+                content,
+                rounds=rounds,
+                prompt_profile=prompt_profile,
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                api_type=api_type,
+                temperature=temperature,
+                chunk_limit=chunk_limit,
+                timeout=timeout,
+                progress_callback=_progress_callback_for_job(job_id),
+            )
+    except Exception as exc:  # noqa: BLE001 - expose concise status to caller, log full traceback.
+        app.logger.exception("deai job %s failed", job_id)
+        _update_job(
+            job_id,
+            status="failed",
+            phase="failed",
+            error=str(exc),
+            heartbeat=True,
+        )
+        return
+
+    _update_job(
+        job_id,
+        status="completed",
+        phase="completed",
+        content=result.get("content"),
+        result={
+            key: value
+            for key, value in result.items()
+            if key != "content"
+        },
+        heartbeat=True,
+    )
+
+
+def _validate_payload(payload: dict | None) -> tuple[dict[str, Any] | None, tuple[Response, int] | None]:
+    if not payload or "content" not in payload:
+        return None, (jsonify({"error": "content is required"}), 400)
+    content = payload["content"]
+    if not isinstance(content, str) or not content.strip():
+        return None, (jsonify({"error": "content must be a non-empty string"}), 400)
+    return dict(payload), None
 
 
 # ---------------------------------------------------------------------------
@@ -160,8 +393,9 @@ def process_deai(
     api_type: str | None = None,
     temperature: float = 0.7,
     chunk_limit: int = 850,
-    timeout: int = 120,
+    timeout: int | None = None,
     dry_run: bool = False,
+    progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     """Run the deai pipeline on *content* and return result dict.
 
@@ -175,12 +409,34 @@ def process_deai(
     round_results: list[dict] = []
     current_text = content
 
+    if progress_callback is not None:
+        progress_callback({
+            "phase": "started",
+            "rounds": rounds,
+            "markdownMode": use_markdown_blocks,
+            "inputLength": len(content),
+        })
+
     for round_num in range(1, rounds + 1):
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "round-start",
+                "round": round_num,
+                "rounds": rounds,
+                "markdownMode": use_markdown_blocks,
+                "inputLength": len(current_text),
+            })
         if dry_run:
             transform = lambda chunk_text, *_: chunk_text  # noqa: E731
         else:
             transform = _build_transform(
-                api_key, model, base_url, api_type, temperature, timeout,
+                api_key,
+                model,
+                base_url,
+                api_type,
+                temperature,
+                timeout,
+                progress_callback=progress_callback,
             )
 
         if use_markdown_blocks:
@@ -207,6 +463,7 @@ def process_deai(
                     prompt_profile=prompt_profile,
                     round_number=round_num,
                     chunk_limit=chunk_limit,
+                    progress_callback=progress_callback,
                 )
                 round_results.append({
                     "round": round_num,
@@ -233,13 +490,22 @@ def process_deai(
                     transform=transform,
                     prompt_profile=prompt_profile,
                     chunk_limit=chunk_limit,
+                    progress_callback=progress_callback,
                 )
                 round_results.append(result)
                 current_text = output_path.read_text(encoding="utf-8")
 
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "round-complete",
+                "round": round_num,
+                "rounds": rounds,
+                "outputLength": len(current_text),
+            })
+
     after_markers = _markdown_structural_markers(current_text)
 
-    return {
+    result = {
         "content": current_text,
         "rounds_executed": rounds,
         "round_details": round_results,
@@ -251,6 +517,14 @@ def process_deai(
         "input_length": len(content),
         "output_length": len(current_text),
     }
+    if progress_callback is not None:
+        progress_callback({
+            "phase": "completed",
+            "rounds": rounds,
+            "outputLength": len(current_text),
+            "markdownIntegrity": result["markdown_integrity"],
+        })
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -289,19 +563,18 @@ def deai_process() -> tuple[Response, int]:
         "dry_run": false            // optional, skip LLM for testing
     }
     """
-    payload = request.get_json(silent=True)
-    if not payload or "content" not in payload:
-        return jsonify({"error": "content is required"}), 400
+    payload, error_response = _validate_payload(request.get_json(silent=True))
+    if error_response is not None:
+        return error_response
+    assert payload is not None
 
     content = payload["content"]
-    if not isinstance(content, str) or not content.strip():
-        return jsonify({"error": "content must be a non-empty string"}), 400
 
     rounds = int(payload.get("rounds", 2))
     prompt_profile = payload.get("prompt_profile", "cn")
     temperature = float(payload.get("temperature", 0.7))
     chunk_limit = int(payload.get("chunk_limit", 850))
-    timeout = int(payload.get("timeout", 120))
+    timeout = _payload_timeout(payload)
     dry_run = bool(payload.get("dry_run"))
 
     # en profile only supports 1 round
@@ -348,6 +621,50 @@ def deai_process() -> tuple[Response, int]:
         # (stack frames, file paths, etc.) to the caller.
         app.logger.exception("deai_process failed")
         return jsonify({"error": "internal error processing deai request"}), 500
+
+
+@app.route("/api/deai/jobs", methods=["POST"])
+def deai_create_job() -> tuple[Response, int]:
+    """Create an asynchronous deai job.
+
+    Long document polish runs can take hours. This endpoint returns quickly
+    and exposes progress/heartbeat through ``GET /api/deai/jobs/<job_id>``.
+    """
+    payload, error_response = _validate_payload(request.get_json(silent=True))
+    if error_response is not None:
+        return error_response
+    assert payload is not None
+
+    job_id = uuid.uuid4().hex
+    now = _now()
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "phase": "queued",
+            "created_at": now,
+            "updated_at": now,
+            "last_heartbeat_at": now,
+            "input_length": len(payload["content"]),
+            "rounds": int(payload.get("rounds", 2)),
+            "prompt_profile": payload.get("prompt_profile", "cn"),
+        }
+
+    worker = threading.Thread(target=_run_deai_job, args=(job_id, payload), daemon=True)
+    worker.start()
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/api/deai/jobs/{job_id}",
+    }), 202
+
+
+@app.route("/api/deai/jobs/<job_id>", methods=["GET"])
+def deai_get_job(job_id: str) -> tuple[Response, int]:
+    job = _job_snapshot(job_id)
+    if job is None:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify(job), 200
 
 
 # ---------------------------------------------------------------------------
