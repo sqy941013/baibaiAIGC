@@ -14,6 +14,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,9 @@ app = Flask(__name__)
 
 DEFAULT_LLM_TIMEOUT_SECONDS = None
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15
+DEFAULT_LLM_PROBE_INTERVAL_SECONDS = 60
+DEFAULT_LLM_PROBE_TIMEOUT_SECONDS = 10
+DEFAULT_LLM_PROBE_FAILURE_THRESHOLD = 3
 _JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
 
@@ -152,19 +157,64 @@ def _build_transform(
         worker = threading.Thread(target=call_llm, daemon=True)
         worker.start()
         started_at = time.time()
+        last_probe_at = 0.0
+        consecutive_probe_failures = 0
+        last_probe: dict[str, Any] | None = None
+        probe_enabled = _llm_probe_enabled()
+        probe_interval = _llm_probe_interval()
+        probe_timeout = _llm_probe_timeout()
+        probe_failure_threshold = _llm_probe_failure_threshold()
         while True:
             try:
                 status, value = result_queue.get(timeout=max(1, heartbeat_interval))
                 break
             except queue.Empty:
-                progress_callback({
+                now = time.time()
+                elapsed_seconds = round(now - started_at, 1)
+                event: dict[str, Any] = {
                     "phase": "llm-request-waiting",
                     "round": round_number,
                     "chunkId": chunk_id,
-                    "elapsedSeconds": round(time.time() - started_at, 1),
+                    "elapsedSeconds": elapsed_seconds,
                     "timeout": timeout or 0,
                     "model": model,
-                })
+                }
+                if probe_enabled and (now - last_probe_at) >= probe_interval:
+                    last_probe_at = now
+                    last_probe = _probe_llm_api(base_url, timeout=probe_timeout)
+                    if last_probe.get("ok"):
+                        consecutive_probe_failures = 0
+                    else:
+                        consecutive_probe_failures += 1
+                    event["llmProbe"] = last_probe
+                    event["llmProbeFailures"] = consecutive_probe_failures
+                elif last_probe is not None:
+                    event["llmProbe"] = last_probe
+                    event["llmProbeFailures"] = consecutive_probe_failures
+
+                progress_callback(event)
+
+                if (
+                    probe_enabled
+                    and consecutive_probe_failures >= probe_failure_threshold
+                ):
+                    detail = last_probe.get("detail") if last_probe else ""
+                    error_message = (
+                        "LLM API liveness probe failed "
+                        f"{consecutive_probe_failures} consecutive times while waiting "
+                        f"for round {round_number} chunk {chunk_id}: "
+                        f"status={(last_probe or {}).get('status')}; detail={detail or 'n/a'}"
+                    )
+                    progress_callback({
+                        "phase": "llm-api-unreachable",
+                        "round": round_number,
+                        "chunkId": chunk_id,
+                        "elapsedSeconds": elapsed_seconds,
+                        "llmProbe": last_probe,
+                        "llmProbeFailures": consecutive_probe_failures,
+                        "error": error_message,
+                    })
+                    raise RuntimeError(error_message)
 
         if status == "error":
             progress_callback({
@@ -215,6 +265,13 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off", "disabled", "disable"}
+
+
 def _optional_timeout_value(value: Any, default: int | None) -> int | None:
     raw = "" if value is None else str(value).strip().lower()
     if raw in {"0", "false", "no", "none", "off", "disabled", "disable"}:
@@ -242,6 +299,73 @@ def _payload_timeout(payload: dict) -> int | None:
 
 def _heartbeat_interval() -> int:
     return _env_int("DEAI_HEARTBEAT_INTERVAL_SECONDS", DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
+
+
+def _llm_probe_enabled() -> bool:
+    return _env_bool("DEAI_LLM_PROBE_ENABLED", True)
+
+
+def _llm_probe_interval() -> int:
+    return _env_int("DEAI_LLM_PROBE_INTERVAL_SECONDS", DEFAULT_LLM_PROBE_INTERVAL_SECONDS)
+
+
+def _llm_probe_timeout() -> int:
+    return _env_int("DEAI_LLM_PROBE_TIMEOUT_SECONDS", DEFAULT_LLM_PROBE_TIMEOUT_SECONDS)
+
+
+def _llm_probe_failure_threshold() -> int:
+    return _env_int("DEAI_LLM_PROBE_FAILURE_THRESHOLD", DEFAULT_LLM_PROBE_FAILURE_THRESHOLD)
+
+
+def _probe_llm_api(base_url: str, *, timeout: int) -> dict[str, Any]:
+    """Return low-cost liveness for the configured upstream LLM endpoint.
+
+    The deai pipeline uses non-streaming LLM calls, so an in-flight request
+    cannot expose token-level progress. While the request is pending we probe
+    the provider base URL only. Any HTTP response below 500 means the endpoint
+    is reachable; 5xx and transport errors are treated as probe failures.
+    """
+
+    probe_url = (base_url or "").strip().rstrip("/")
+    if not probe_url:
+        return {
+            "ok": False,
+            "status": "missing_base_url",
+            "checked_at": _now(),
+        }
+
+    request_obj = urllib.request.Request(
+        probe_url,
+        headers={"User-Agent": "ai-doc-gen-deai-liveness/1.0"},
+        method="GET",
+    )
+    checked_at = _now()
+    try:
+        with urllib.request.urlopen(request_obj, timeout=timeout) as response:
+            status_code = int(getattr(response, "status", 200) or 200)
+        return {
+            "ok": status_code < 500,
+            "status": status_code,
+            "checked_at": checked_at,
+            "url": probe_url,
+        }
+    except urllib.error.HTTPError as exc:
+        status_code = int(getattr(exc, "code", 0) or 0)
+        return {
+            "ok": 0 < status_code < 500,
+            "status": status_code or "http_error",
+            "checked_at": checked_at,
+            "url": probe_url,
+            "detail": str(exc.reason or exc),
+        }
+    except Exception as exc:  # noqa: BLE001 - probe failure should be reported, not crash formatting.
+        return {
+            "ok": False,
+            "status": "transport_error",
+            "checked_at": checked_at,
+            "url": probe_url,
+            "detail": str(exc),
+        }
 
 
 def _now() -> float:
