@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from typing import Any, Callable
 from urllib import error, request
 
 
@@ -12,6 +14,7 @@ DEFAULT_HEADERS = {
     "User-Agent": "curl/8.7.1",
 }
 ERROR_BODY_PREVIEW_LIMIT = 240
+StreamEventCallback = Callable[[dict[str, object]], None]
 
 
 class LLMClientError(RuntimeError):
@@ -83,6 +86,17 @@ def build_headers(api_key: str) -> dict[str, str]:
         **DEFAULT_HEADERS,
         "Authorization": f"Bearer {api_key}",
     }
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off", "disabled", "disable"}
+
+
+def _llm_stream_enabled() -> bool:
+    return _env_bool("DEAI_LLM_STREAM", True)
 
 
 def _preview_response_body(response_body: str) -> str:
@@ -171,6 +185,94 @@ def _extract_text_candidate(value: object) -> str:
         return _join_text_parts(nested_parts)
 
     return ""
+
+
+def _extract_stream_texts(chunk: dict[str, object]) -> tuple[str, str]:
+    choices = chunk.get("choices")
+    if not isinstance(choices, list):
+        return "", ""
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            for key in ("content", "text", "output_text"):
+                text = _extract_text_candidate(delta.get(key))
+                if text:
+                    content_parts.append(text)
+            for key in ("reasoning_content", "reasoning", "thinking"):
+                text = _extract_text_candidate(delta.get(key))
+                if text:
+                    reasoning_parts.append(text)
+
+        message = choice.get("message")
+        if isinstance(message, dict):
+            text = _extract_text_candidate(message.get("content"))
+            if text:
+                content_parts.append(text)
+            for key in ("reasoning_content", "reasoning", "thinking"):
+                reasoning_text = _extract_text_candidate(message.get(key))
+                if reasoning_text:
+                    reasoning_parts.append(reasoning_text)
+
+        text = _extract_text_candidate(choice.get("text"))
+        if text:
+            content_parts.append(text)
+
+    return "".join(content_parts), "".join(reasoning_parts)
+
+
+def _iter_sse_payloads(response: Any):
+    event_lines: list[str] = []
+    while True:
+        raw_line = response.readline()
+        if not raw_line:
+            if event_lines:
+                yield "\n".join(event_lines)
+            break
+
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace")
+        else:
+            line = str(raw_line)
+        line = line.rstrip("\r\n")
+
+        if not line:
+            if event_lines:
+                yield "\n".join(event_lines)
+                event_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            event_lines.append(line[5:].lstrip())
+
+
+def _raise_stream_error(data: dict[str, object], api_type: str) -> None:
+    error_payload = data.get("error")
+    if not isinstance(error_payload, dict):
+        return
+
+    message = str(
+        error_payload.get("message")
+        or error_payload.get("error")
+        or error_payload
+    )
+    status = error_payload.get("status") or error_payload.get("status_code")
+    provider_status = int(status) if isinstance(status, int) else None
+    raise LLMClientError(
+        f"LLM stream returned error: {_preview_response_body(message)}",
+        code="provider_stream_error",
+        stage="llm_stream",
+        retriable=provider_status is None or provider_status >= 500 or provider_status == 429,
+        provider_status=provider_status,
+        api_type=api_type,
+        detail=_preview_response_body(message),
+    )
 
 
 def extract_response_text(data: dict[str, object], response_body: str, api_type: str) -> str:
@@ -282,6 +384,121 @@ def _request_llm_json(
     )
 
 
+def _request_llm_stream_text(
+    payload: dict[str, object],
+    *,
+    api_key: str,
+    base_url: str,
+    api_type: str | None,
+    timeout: int | None,
+    stream_callback: StreamEventCallback | None = None,
+) -> tuple[str, int, str, str]:
+    resolved_api_type = normalize_api_type(api_type, base_url)
+    if resolved_api_type != "chat_completions":
+        data, status_code, endpoint, resolved_api_type, response_body = _request_llm_json(
+            payload,
+            api_key=api_key,
+            base_url=base_url,
+            api_type=api_type,
+            timeout=timeout,
+        )
+        return extract_response_text(data, response_body, resolved_api_type), status_code, endpoint, resolved_api_type
+
+    endpoint = build_endpoint(base_url, resolved_api_type)
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+    body = json.dumps(stream_payload).encode("utf-8")
+    headers = build_headers(api_key)
+    headers["Accept"] = "text/event-stream"
+
+    http_request = request.Request(
+        endpoint,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+
+    started_at = time.time()
+    output_parts: list[str] = []
+    output_chars = 0
+    event_count = 0
+    done_seen = False
+
+    try:
+        with request.urlopen(http_request, timeout=timeout) as response:
+            status_code = int(getattr(response, "status", 200) or 200)
+            for payload_text in _iter_sse_payloads(response):
+                if payload_text.strip() == "[DONE]":
+                    done_seen = True
+                    break
+                event_count += 1
+                try:
+                    data = json.loads(payload_text)
+                except json.JSONDecodeError as exc:
+                    preview = _preview_response_body(payload_text)
+                    raise LLMClientError(
+                        f"LLM stream returned invalid JSON event: {preview}",
+                        code="provider_invalid_stream_json",
+                        stage="llm_stream",
+                        retriable=True,
+                        provider_status=status_code,
+                        api_type=resolved_api_type,
+                        detail=preview,
+                    ) from exc
+                if not isinstance(data, dict):
+                    preview = _preview_response_body(payload_text)
+                    raise LLMClientError(
+                        f"Unexpected LLM stream event payload: {preview}",
+                        code="provider_unexpected_stream_schema",
+                        stage="llm_stream",
+                        retriable=False,
+                        provider_status=status_code,
+                        api_type=resolved_api_type,
+                        detail=preview,
+                    )
+
+                _raise_stream_error(data, resolved_api_type)
+                content_delta, reasoning_delta = _extract_stream_texts(data)
+                if content_delta:
+                    output_parts.append(content_delta)
+                    output_chars += len(content_delta)
+                if stream_callback is not None and (content_delta or reasoning_delta):
+                    stream_callback({
+                        "phase": "llm-stream-chunk",
+                        "eventIndex": event_count,
+                        "delta": content_delta,
+                        "deltaChars": len(content_delta),
+                        "reasoningChars": len(reasoning_delta),
+                        "outputChars": output_chars,
+                        "elapsedSeconds": round(time.time() - started_at, 1),
+                    })
+    except error.HTTPError as exc:
+        _raise_http_error(exc, resolved_api_type)
+    except error.URLError as exc:
+        raise LLMClientError(
+            f"LLM request failed: {exc.reason}",
+            code="provider_network_error",
+            stage="llm_http",
+            retriable=True,
+            api_type=resolved_api_type,
+            detail=str(exc.reason),
+        ) from exc
+
+    text = "".join(output_parts).strip()
+    if not text:
+        detail = f"events={event_count}, done={done_seen}"
+        raise LLMClientError(
+            f"LLM stream completed without content ({detail})",
+            code="provider_empty_stream",
+            stage="llm_stream",
+            retriable=True,
+            provider_status=status_code,
+            api_type=resolved_api_type,
+            detail=detail,
+        )
+    return text, status_code, endpoint, resolved_api_type
+
+
 def llm_completion(
     prompt: str,
     *,
@@ -291,13 +508,29 @@ def llm_completion(
     api_type: str | None = None,
     temperature: float = 0.7,
     timeout: int | None = None,
+    stream: bool | None = None,
+    stream_callback: StreamEventCallback | None = None,
 ) -> str:
+    resolved_api_type = normalize_api_type(api_type, base_url)
     payload = build_payload(
         prompt,
         model=model,
         temperature=temperature,
-        api_type=normalize_api_type(api_type, base_url),
+        api_type=resolved_api_type,
     )
+
+    use_stream = _llm_stream_enabled() if stream is None else bool(stream)
+    if use_stream and resolved_api_type == "chat_completions":
+        text, _, _, _ = _request_llm_stream_text(
+            payload,
+            api_key=api_key,
+            base_url=base_url,
+            api_type=resolved_api_type,
+            timeout=timeout,
+            stream_callback=stream_callback,
+        )
+        return text
+
     data, _, _, resolved_api_type, response_body = _request_llm_json(
         payload,
         api_key=api_key,
