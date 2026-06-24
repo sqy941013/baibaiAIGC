@@ -136,6 +136,22 @@ def _build_transform(
             "model": model,
         })
         result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+        started_at = time.time()
+
+        def emit_stream_progress(event: dict[str, object]) -> None:
+            progress_event = {key: value for key, value in event.items() if key != "delta"}
+            progress_callback({
+                **progress_event,
+                "phase": "llm-stream-chunk",
+                "round": round_number,
+                "chunkId": chunk_id,
+                "elapsedSeconds": progress_event.get(
+                    "elapsedSeconds",
+                    round(time.time() - started_at, 1),
+                ),
+                "timeout": timeout or 0,
+                "model": model,
+            })
 
         def call_llm() -> None:
             try:
@@ -149,6 +165,7 @@ def _build_transform(
                         api_type=api_type,
                         temperature=temperature,
                         timeout=timeout,
+                        stream_callback=emit_stream_progress,
                     ),
                 ))
             except Exception as exc:  # noqa: BLE001 - propagate original error to caller.
@@ -156,7 +173,6 @@ def _build_transform(
 
         worker = threading.Thread(target=call_llm, daemon=True)
         worker.start()
-        started_at = time.time()
         last_probe_at = 0.0
         consecutive_probe_failures = 0
         last_probe: dict[str, Any] | None = None
@@ -320,10 +336,11 @@ def _llm_probe_failure_threshold() -> int:
 def _probe_llm_api(base_url: str, *, timeout: int) -> dict[str, Any]:
     """Return low-cost liveness for the configured upstream LLM endpoint.
 
-    The deai pipeline uses non-streaming LLM calls, so an in-flight request
-    cannot expose token-level progress. While the request is pending we probe
-    the provider base URL only. Any HTTP response below 500 means the endpoint
-    is reachable; 5xx and transport errors are treated as probe failures.
+    Streaming chunk progress refreshes the job heartbeat when the provider is
+    actively returning data. When no stream data has arrived for a heartbeat
+    interval, this probe checks whether the configured provider base URL is
+    still reachable. Any HTTP response below 500 means the endpoint is
+    reachable; 5xx and transport errors are treated as probe failures.
     """
 
     probe_url = (base_url or "").strip().rstrip("/")
