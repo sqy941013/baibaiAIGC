@@ -392,6 +392,7 @@ def _request_llm_stream_text(
     api_type: str | None,
     timeout: int | None,
     stream_callback: StreamEventCallback | None = None,
+    max_output_chars: int | None = None,
 ) -> tuple[str, int, str, str]:
     resolved_api_type = normalize_api_type(api_type, base_url)
     if resolved_api_type != "chat_completions":
@@ -472,6 +473,19 @@ def _request_llm_stream_text(
                         "outputChars": output_chars,
                         "elapsedSeconds": round(time.time() - started_at, 1),
                     })
+                if max_output_chars is not None and output_chars > max_output_chars:
+                    raise LLMClientError(
+                        (
+                            "LLM stream output expanded abnormally; "
+                            f"output chars {output_chars} exceeded limit {max_output_chars}"
+                        ),
+                        code="provider_output_too_long",
+                        stage="llm_stream",
+                        retriable=False,
+                        provider_status=status_code,
+                        api_type=resolved_api_type,
+                        detail=f"output_chars={output_chars}, max_output_chars={max_output_chars}",
+                    )
     except error.HTTPError as exc:
         _raise_http_error(exc, resolved_api_type)
     except error.URLError as exc:
@@ -510,6 +524,7 @@ def llm_completion(
     timeout: int | None = None,
     stream: bool | None = None,
     stream_callback: StreamEventCallback | None = None,
+    max_output_chars: int | None = None,
 ) -> str:
     resolved_api_type = normalize_api_type(api_type, base_url)
     payload = build_payload(
@@ -528,6 +543,7 @@ def llm_completion(
             api_type=resolved_api_type,
             timeout=timeout,
             stream_callback=stream_callback,
+            max_output_chars=max_output_chars,
         )
         return text
 

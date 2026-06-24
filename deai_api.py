@@ -30,7 +30,12 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from markdown_chunks import detect_markdown_blocks, process_text_blocks  # noqa: E402
 from aigc_records import ROOT_DIR  # noqa: E402
-from aigc_round_service import PROMPT_PROFILES, run_round  # noqa: E402
+from aigc_round_service import (  # noqa: E402
+    LENGTH_EXPANSION_HEADROOM,
+    LENGTH_EXPANSION_MULTIPLIER,
+    PROMPT_PROFILES,
+    run_round,
+)
 from llm_client import llm_completion, read_api_config  # noqa: E402
 from app_config import get_app_config_path, load_app_config  # noqa: E402
 
@@ -43,6 +48,10 @@ DEFAULT_LLM_PROBE_TIMEOUT_SECONDS = 10
 DEFAULT_LLM_PROBE_FAILURE_THRESHOLD = 3
 _JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
+
+
+class JobCancelled(RuntimeError):
+    """Raised internally when an async deai job is cancelled."""
 
 
 def _expected_prompt_paths() -> list[Path]:
@@ -117,6 +126,10 @@ def _build_transform(
 ):
     """Return a transform(chunk_text, prompt_input, round_number, chunk_id) -> str."""
     def transform(chunk_text: str, prompt_input: str, round_number: int, chunk_id: str) -> str:
+        max_output_chars = max(
+            len(chunk_text) * LENGTH_EXPANSION_MULTIPLIER,
+            len(chunk_text) + LENGTH_EXPANSION_HEADROOM,
+        )
         if progress_callback is None:
             return llm_completion(
                 prompt_input,
@@ -126,6 +139,7 @@ def _build_transform(
                 api_type=api_type,
                 temperature=temperature,
                 timeout=timeout,
+                max_output_chars=max_output_chars,
             )
 
         progress_callback({
@@ -166,6 +180,7 @@ def _build_transform(
                         temperature=temperature,
                         timeout=timeout,
                         stream_callback=emit_stream_progress,
+                        max_output_chars=max_output_chars,
                     ),
                 ))
             except Exception as exc:  # noqa: BLE001 - propagate original error to caller.
@@ -395,6 +410,8 @@ def _update_job(job_id: str, **fields: Any) -> None:
         job = _JOBS.get(job_id)
         if job is None:
             return
+        if job.get("status") == "cancelled" and fields.get("status") != "cancelled":
+            return
         job.update(fields)
         job["updated_at"] = now
         if fields.get("heartbeat", True):
@@ -411,6 +428,12 @@ def _job_snapshot(job_id: str) -> dict[str, Any] | None:
     if data.get("status") != "completed":
         data.pop("content", None)
     return data
+
+
+def _job_cancelled(job_id: str) -> bool:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        return bool(job and job.get("status") == "cancelled")
 
 
 def _sse_payload(event: str, data: dict[str, Any]) -> str:
@@ -458,6 +481,9 @@ def _iter_job_events(job_id: str):
         if status == "failed":
             yield _sse_payload("failed", job)
             return
+        if status == "cancelled":
+            yield _sse_payload("cancelled", job)
+            return
 
         yield ": heartbeat\n\n"
         time.sleep(interval)
@@ -465,6 +491,8 @@ def _iter_job_events(job_id: str):
 
 def _progress_callback_for_job(job_id: str):
     def capture(event: dict[str, Any]) -> None:
+        if _job_cancelled(job_id):
+            raise JobCancelled("deai job cancelled")
         phase = str(event.get("phase") or "running")
         _update_job(
             job_id,
@@ -522,6 +550,15 @@ def _run_deai_job(job_id: str, payload: dict[str, Any]) -> None:
                 timeout=timeout,
                 progress_callback=_progress_callback_for_job(job_id),
             )
+    except JobCancelled as exc:
+        _update_job(
+            job_id,
+            status="cancelled",
+            phase="cancelled",
+            error=str(exc),
+            heartbeat=True,
+        )
+        return
     except Exception as exc:  # noqa: BLE001 - expose concise status to caller, log full traceback.
         app.logger.exception("deai job %s failed", job_id)
         _update_job(
@@ -529,6 +566,16 @@ def _run_deai_job(job_id: str, payload: dict[str, Any]) -> None:
             status="failed",
             phase="failed",
             error=str(exc),
+            heartbeat=True,
+        )
+        return
+
+    if _job_cancelled(job_id):
+        _update_job(
+            job_id,
+            status="cancelled",
+            phase="cancelled",
+            error="deai job cancelled",
             heartbeat=True,
         )
         return
@@ -848,6 +895,7 @@ def deai_create_job() -> tuple[Response, int]:
         "status": "queued",
         "status_url": f"/api/deai/jobs/{job_id}",
         "stream_url": f"/api/deai/jobs/{job_id}/stream",
+        "cancel_url": f"/api/deai/jobs/{job_id}/cancel",
     }), 202
 
 
@@ -857,6 +905,25 @@ def deai_get_job(job_id: str) -> tuple[Response, int]:
     if job is None:
         return jsonify({"error": "job not found"}), 404
     return jsonify(job), 200
+
+
+@app.route("/api/deai/jobs/<job_id>/cancel", methods=["POST"])
+def deai_cancel_job(job_id: str) -> tuple[Response, int]:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return jsonify({"error": "job not found"}), 404
+        if job.get("status") in {"completed", "failed", "cancelled"}:
+            return jsonify(dict(job)), 200
+
+    _update_job(
+        job_id,
+        status="cancelled",
+        phase="cancelled",
+        error="deai job cancelled",
+        heartbeat=True,
+    )
+    return jsonify(_job_snapshot(job_id) or {"job_id": job_id, "status": "cancelled"}), 200
 
 
 @app.route("/api/deai/jobs/<job_id>/stream", methods=["GET"])
