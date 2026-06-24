@@ -413,6 +413,56 @@ def _job_snapshot(job_id: str) -> dict[str, Any] | None:
     return data
 
 
+def _sse_payload(event: str, data: dict[str, Any]) -> str:
+    return (
+        f"event: {event}\n"
+        f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    )
+
+
+def _job_stream_interval() -> float:
+    raw = os.environ.get("DEAI_JOB_STREAM_INTERVAL_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(0.25, float(raw))
+        except ValueError:
+            app.logger.warning("Invalid DEAI_JOB_STREAM_INTERVAL_SECONDS=%r, using default 1", raw)
+    return 1.0
+
+
+def _iter_job_events(job_id: str):
+    """Yield Server-Sent Events for a job until it reaches a terminal state."""
+
+    interval = _job_stream_interval()
+    last_revision: tuple[object, object, object, object] | None = None
+    while True:
+        job = _job_snapshot(job_id)
+        if job is None:
+            yield _sse_payload("error", {"error": "job not found", "job_id": job_id})
+            return
+
+        revision = (
+            job.get("status"),
+            job.get("phase"),
+            job.get("updated_at"),
+            job.get("last_heartbeat_at"),
+        )
+        if revision != last_revision:
+            last_revision = revision
+            yield _sse_payload("job", job)
+
+        status = str(job.get("status") or "").strip().lower()
+        if status == "completed":
+            yield _sse_payload("completed", job)
+            return
+        if status == "failed":
+            yield _sse_payload("failed", job)
+            return
+
+        yield ": heartbeat\n\n"
+        time.sleep(interval)
+
+
 def _progress_callback_for_job(job_id: str):
     def capture(event: dict[str, Any]) -> None:
         phase = str(event.get("phase") or "running")
@@ -797,6 +847,7 @@ def deai_create_job() -> tuple[Response, int]:
         "job_id": job_id,
         "status": "queued",
         "status_url": f"/api/deai/jobs/{job_id}",
+        "stream_url": f"/api/deai/jobs/{job_id}/stream",
     }), 202
 
 
@@ -806,6 +857,25 @@ def deai_get_job(job_id: str) -> tuple[Response, int]:
     if job is None:
         return jsonify({"error": "job not found"}), 404
     return jsonify(job), 200
+
+
+@app.route("/api/deai/jobs/<job_id>/stream", methods=["GET"])
+def deai_stream_job(job_id: str) -> Response:
+    """Stream job progress with Server-Sent Events.
+
+    The polling status endpoint remains the compatibility contract. This
+    stream endpoint lets callers keep one read open and receive every
+    heartbeat/progress update produced by the LLM streaming callback.
+    """
+
+    return Response(
+        _iter_job_events(job_id),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
